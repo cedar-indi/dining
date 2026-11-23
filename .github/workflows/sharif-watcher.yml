@@ -1,0 +1,242 @@
+name: Sharif menu alerts
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: Send a test message without contacting Sharif
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: sharif-menu-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Restore alert state
+        if: ${{ !inputs.test_telegram }}
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: watcher-state.json
+          key: sharif-alerts-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sharif-alerts-v1-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python packages
+        run: python3 -m pip install 'requests>=2.32,<3' 'beautifulsoup4>=4.12,<5'
+
+      - name: Check menus
+        id: watch
+        env:
+          SHARIF_USERNAME: ${{ secrets.SHARIF_USERNAME }}
+          SHARIF_PASSWORD: ${{ secrets.SHARIF_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_TELEGRAM: ${{ inputs.test_telegram }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          from datetime import datetime, timedelta, timezone
+          from email.utils import parsedate_to_datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          BASE = "https://setad.dining.sharif.edu"
+          LOGIN = BASE + "/index.rose"
+          MENU = BASE + "/nurture/user/multi/reserve/reserve.rose"
+          PANEL = BASE + "/nurture/user/multi/reserve/showPanel.rose"
+          CAFETERIAS = ("1", "20", "21", "22", "23", "24", "25")
+          WEEK_MS = 604_800_000
+          TEHRAN = ZoneInfo("Asia/Tehran")
+          STATE = Path("watcher-state.json")
+          MEAL = 'input[type="checkbox"][name^="userWeekReserves["][name$="].selected"]:not([disabled])'
+
+          class WatcherError(Exception):
+              pass
+
+          def secret(name):
+              value = os.environ.get(name)
+              if not value:
+                  raise WatcherError(f"Missing GitHub secret {name}")
+              return value
+
+          def portal(session, state, method, url, **kwargs):
+              try:
+                  response = session.request(method, url, timeout=(5, 10), **kwargs)
+              except requests.RequestException:
+                  raise WatcherError("Could not reach the Sharif portal.") from None
+
+              if response.status_code in (401, 403, 429, 503):
+                  now = time.time()
+                  fallback = 3600 if response.status_code in (401, 403) else 900
+                  retry = response.headers.get("Retry-After", "")
+                  delay = fallback
+                  if retry.isdecimal():
+                      delay = int(retry)
+                  elif retry:
+                      try:
+                          stamp = parsedate_to_datetime(retry)
+                          delay = (stamp.replace(tzinfo=stamp.tzinfo or timezone.utc)
+                                   .timestamp() - now)
+                      except (ValueError, OverflowError):
+                          pass
+                  state["portal_after"] = int(now + max(300, delay))
+                  raise WatcherError(f"Sharif returned HTTP {response.status_code}. Polling paused.")
+              if response.status_code >= 400:
+                  raise WatcherError(f"Sharif returned HTTP {response.status_code}.")
+              return BeautifulSoup(response.content, "html.parser")
+
+          def field(form, name):
+              node = form.find("input", attrs={"name": name})
+              return node.get("value", "") if node else ""
+
+          def week_key(milliseconds):
+              day = datetime.fromtimestamp(milliseconds / 1000, TEHRAN).date()
+              return (day - timedelta(days=(day.weekday() - 5) % 7)).isoformat()
+
+          def telegram(message):
+              token = secret("TELEGRAM_BOT_TOKEN")
+              chat_id = secret("TELEGRAM_CHAT_ID")
+              try:
+                  response = requests.post(
+                      f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": chat_id, "text": message},
+                      timeout=(5, 10),
+                      allow_redirects=False,
+                  )
+                  if not response.ok or response.json().get("ok") is not True:
+                      raise WatcherError(f"Telegram rejected the alert (HTTP {response.status_code}).")
+              except (requests.RequestException, ValueError, AttributeError):
+                  raise WatcherError("Telegram message failed. Check the token and chat ID.") from None
+
+          def scan(state):
+              username, password = secret("SHARIF_USERNAME"), secret("SHARIF_PASSWORD")
+              with requests.Session() as session:
+                  session.headers["User-Agent"] = "Mozilla/5.0 SharifMenuWatcher/1.0"
+                  login = portal(session, state, "GET", LOGIN)
+                  csrf = field(login, "_csrf")
+                  if not csrf:
+                      raise WatcherError("The Sharif login form is missing its CSRF field.")
+                  portal(session, state, "POST", BASE + "/j_security_check",
+                         data={"_csrf": csrf, "username": username, "password": password, "login": ""},
+                         headers={"Referer": LOGIN})
+
+                  form = portal(session, state, "GET", PANEL).find("form", id="resFinalform")
+                  if not form:
+                      state["portal_after"] = int(time.time()) + 1800
+                      raise WatcherError("Reservation form missing after login. Check your Sharif login.")
+                  csrf = field(form, "_csrf")
+                  start = field(form, "weekStartDateTime")
+                  ajax = field(form, "weekStartDateTimeAjx")
+                  if not csrf or not start.isdecimal() or not ajax.isdecimal():
+                      raise WatcherError("Reservation form is missing its week or CSRF fields.")
+
+                  target = int(start) + WEEK_MS
+                  week = week_key(target)
+                  if state.get("week") != week:
+                      state.update(week=week, sent=[], pending=[])
+
+                  mismatches = []
+                  for cafeteria in CAFETERIAS:
+                      if cafeteria in state["sent"] or cafeteria in state["pending"]:
+                          continue
+                      time.sleep(2)
+                      menu = portal(session, state, "POST", MENU, headers={"Referer": PANEL}, data={
+                          "_csrf": csrf,
+                          "weekStartDateTime": str(target),
+                          "weekStartDateTimeAjx": str(int(ajax) + WEEK_MS),
+                          "selectedSelfDefId": cafeteria,
+                          "selectedSelfDefIdCombo": cafeteria,
+                          "method:showPanel": "Submit",
+                      }).find("form", id="resFinalform")
+                      if not menu:
+                          raise WatcherError("Reservation form disappeared during the menu check.")
+
+                      returned_start = field(menu, "weekStartDateTime")
+                      if (field(menu, "selectedSelfDefId") != cafeteria
+                              or not returned_start.isdecimal()
+                              or week_key(int(returned_start)) != week):
+                          mismatches.append(cafeteria)
+                          continue
+
+                      options = len(menu.select(MEAL))
+                      print(f"Cafeteria {cafeteria}, week {week}, selectable meals: {options}")
+                      if options:
+                          state["pending"].append(cafeteria)
+
+                  if mismatches:
+                      raise WatcherError("Unexpected cafeteria or week for IDs " + ", ".join(mismatches))
+
+          def run(state):
+              failed = False
+              try:
+                  secret("TELEGRAM_BOT_TOKEN")
+                  secret("TELEGRAM_CHAT_ID")
+                  if time.time() >= state.get("portal_after", 0):
+                      state.pop("portal_after", None)
+                      scan(state)
+                  else:
+                      print("Sharif polling is paused. Will check again after the cooldown.")
+              except WatcherError as error:
+                  print(error)
+                  failed = True
+
+              pending = state.get("pending", [])
+              if pending:
+                  try:
+                      telegram(f"🍽 Sharif menu available for the week of {state['week']}\n"
+                               f"Cafeteria IDs: {', '.join(pending)}\nReserve here: {PANEL}")
+                  except WatcherError as error:
+                      print(error)
+                      failed = True
+                  else:
+                      state["sent"].extend(pending)
+                      pending.clear()
+                      print("Telegram alert sent.")
+              return int(failed)
+
+          if os.environ.get("TEST_TELEGRAM") == "true":
+              try:
+                  telegram("✅ Your Sharif menu watcher can send Telegram alerts.")
+              except WatcherError as error:
+                  raise SystemExit(str(error)) from None
+              print("Telegram test message sent.")
+          else:
+              previous = STATE.read_text() if STATE.exists() else "{}"
+              state = json.loads(previous)
+              try:
+                  status = run(state)
+              finally:
+                  current = json.dumps(state, sort_keys=True)
+                  if current != previous:
+                      temporary = STATE.with_suffix(".tmp")
+                      temporary.write_text(current)
+                      temporary.replace(STATE)
+                      with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                          print("state_changed=true", file=output)
+              raise SystemExit(status)
+          PY
+
+      - name: Save alert state
+        if: ${{ !cancelled() && steps.watch.outputs.state_changed == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: watcher-state.json
+          key: ${{ steps.state.outputs.cache-primary-key }}
