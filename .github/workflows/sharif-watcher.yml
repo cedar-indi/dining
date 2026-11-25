@@ -2,15 +2,20 @@ name: Sharif menu alerts
 
 on:
   schedule:
-    - cron: '2-57/5 * * * *'
+    - cron: '30 14 * * 1'
   workflow_dispatch:
     inputs:
       test_telegram:
         description: Send a test message without contacting Sharif
         type: boolean
         default: false
+      continue_cycle:
+        description: Leave blank. The workflow uses this to resume long waits.
+        type: string
+        required: false
 
-permissions: {}
+permissions:
+  actions: write
 
 concurrency:
   group: sharif-menu-watcher
@@ -19,7 +24,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 360
     steps:
       - name: Restore alert state
         if: ${{ !inputs.test_telegram }}
@@ -45,6 +50,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_TELEGRAM: ${{ inputs.test_telegram }}
+          CONTINUE_CYCLE: ${{ inputs.continue_cycle }}
+          PYTHONUNBUFFERED: '1'
         run: |
           python3 - <<'PY'
           import json
@@ -142,6 +149,7 @@ jobs:
                   if not form:
                       state["portal_after"] = int(time.time()) + 1800
                       raise WatcherError("Reservation form missing after login. Check your Sharif login.")
+
                   csrf = field(form, "_csrf")
                   start = field(form, "weekStartDateTime")
                   ajax = field(form, "weekStartDateTimeAjx")
@@ -157,6 +165,7 @@ jobs:
                   for cafeteria in CAFETERIAS:
                       if cafeteria in state["sent"] or cafeteria in state["pending"]:
                           continue
+
                       time.sleep(2)
                       menu = portal(session, state, "POST", MENU, headers={"Referer": PANEL}, data={
                           "_csrf": csrf,
@@ -219,19 +228,56 @@ jobs:
                   raise SystemExit(str(error)) from None
               print("Telegram test message sent.")
           else:
+              now = datetime.now(timezone.utc)
+              monday = (now - timedelta(days=now.weekday())).replace(
+                  hour=14, minute=30, second=0, microsecond=0
+              )
+              if monday > now:
+                  monday -= timedelta(days=7)
+              cycle = monday.date().isoformat()
+              if os.environ.get("CONTINUE_CYCLE", "") not in ("", cycle):
+                  print("The requested monitoring week has ended.")
+                  raise SystemExit(0)
+
+              for name in ("SHARIF_USERNAME", "SHARIF_PASSWORD",
+                           "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+                  try:
+                      secret(name)
+                  except WatcherError as error:
+                      raise SystemExit(str(error)) from None
+
               previous = STATE.read_text() if STATE.exists() else "{}"
               state = json.loads(previous)
+              if state.get("cycle") != cycle:
+                  state = {"cycle": cycle}
+
+              week_end = (monday + timedelta(days=7)).timestamp()
+              segment_end = time.monotonic() + 5 * 3600 + 40 * 60
+              resume = False
               try:
-                  status = run(state)
+                  while not state.get("sent") and time.time() < week_end:
+                      started = time.monotonic()
+                      if started >= segment_end:
+                          resume = True
+                          break
+
+                      run(state)
+                      if state.get("sent"):
+                          print("First menu alert delivered. Monitoring is complete for this week.")
+                          break
+
+                      delay = min(300 - (time.monotonic() - started), week_end - time.time())
+                      time.sleep(max(0, delay))
               finally:
                   current = json.dumps(state, sort_keys=True)
-                  if current != previous:
-                      temporary = STATE.with_suffix(".tmp")
-                      temporary.write_text(current)
-                      temporary.replace(STATE)
-                      with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                      if current != previous:
+                          temporary = STATE.with_suffix(".tmp")
+                          temporary.write_text(current)
+                          temporary.replace(STATE)
                           print("state_changed=true", file=output)
-              raise SystemExit(status)
+                      if resume:
+                          print(f"resume_cycle={cycle}", file=output)
           PY
 
       - name: Save alert state
@@ -240,3 +286,12 @@ jobs:
         with:
           path: watcher-state.json
           key: ${{ steps.state.outputs.cache-primary-key }}
+
+      - name: Resume checking in a new run if needed
+        if: ${{ steps.watch.outputs.resume_cycle != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_CYCLE: ${{ steps.watch.outputs.resume_cycle }}
+        run: |
+          gh workflow run sharif-watcher.yml --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" -f "continue_cycle=$RESUME_CYCLE"
